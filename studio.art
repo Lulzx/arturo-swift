@@ -1,0 +1,452 @@
+; studio.art — Arturo runtime for the native SwiftUI + Metal SDF studio
+; Mirrors the C ABI in studio_host.swift, with packed two-argument entry
+; points because call.external supports at most two parameters.
+;
+; The sdf block is lowered into Metal source: every node becomes a function
+;   float map_<id>(float3 p, thread float3 &g)
+; whose gradient g is computed analytically and transported back through any
+; point transform with the transpose of its Jacobian.
+
+lib: "./libswift_studio.dylib"
+
+studioEnv: #[
+    slots: #[]
+    next: 0
+    initialized: false
+    looping: false
+]
+
+ffiCall: function [fn args][
+    call .external: lib .expect: :integer fn args
+]
+
+ensureSlot: function [env name width][
+    if key? env\slots name [ return env\slots\[name] ]
+    slot: env\next
+    env\slots\[name]: slot
+    env\next: slot + width
+    slot
+]
+
+floatText: function [v][
+    to :string (to :floating v)
+]
+
+sliderSpec: function [name lo hi def][
+    name ++ "|" ++ (floatText lo) ++ "|" ++ (floatText hi) ++ "|" ++ (floatText def)
+]
+
+readSlider: function [env body i][
+    name: to :string body\[i+1]
+    lo: body\[i+2]
+    hi: body\[i+4]
+    def: body\[i+5]
+    slot: ensureSlot env name 1
+    spec: sliderSpec name lo hi def
+    ffiCall 'studio_add_slider_p @[slot spec]
+    i + 5
+]
+
+readToggle: function [env body i][
+    name: to :string body\[i+1]
+    def: body\[i+2]
+    flag: 0
+    if def = true [ flag: 1 ]
+    if (to :string def) = "true" [ flag: 1 ]
+    slot: ensureSlot env name 1
+    spec: name ++ "|" ++ (to :string flag)
+    ffiCall 'studio_add_toggle_p @[slot spec]
+    i + 2
+]
+
+readColor: function [env body i][
+    name: to :string body\[i+1]
+    value: to :string body\[i+2]
+    slot: ensureSlot env name 3
+    spec: name ++ "|" ++ value
+    ffiCall 'studio_add_color_p @[slot spec]
+    i + 2
+]
+
+nextBlock: function [body i][
+    j: i + 1
+    while [j < size body][
+        if (type body\[j]) = :block [ return body\[j] ]
+        j: j + 1
+    ]
+    null
+]
+
+scanBody: function [env body][
+    i: 0
+    while [i < size body][
+        tok: body\[i]
+        if (type tok) = :word [
+            label: to :string tok
+            if label = "slider" [ i: readSlider env body i ]
+            if label = "toggle" [ i: readToggle env body i ]
+            if label = "color"  [ i: readColor env body i ]
+            if label = "sdf"    [ env\sdf: nextBlock body i ]
+        ]
+        i: i + 1
+    ]
+]
+
+; ------------------------------------------------------- symbolic lowering
+
+emitLine: function [buf text][
+    buf\lines: buf\lines ++ @[text]
+]
+
+scalar: function [env ctx tok][
+    t: type tok
+    if t = :floating [ return floatText tok ]
+    if t = :integer [ return floatText tok ]
+    if t = :word [
+        label: to :string tok
+        if key? env\slots label [
+            return "u.params[" ++ (to :string env\slots\[label]) ++ "]"
+        ]
+        return "0.0"
+    ]
+    "0.0"
+]
+
+vec3Expr: function [env ctx a b c][
+    "float3(" ++ (scalar env ctx a) ++ ", " ++ (scalar env ctx b) ++ ", " ++ (scalar env ctx c) ++ ")"
+]
+
+identityMatrix: "float3x3(float3(1.0, 0.0, 0.0), float3(0.0, 1.0, 0.0), float3(0.0, 0.0, 1.0))"
+
+; Appends q<d> / J<d> definitions to buf and returns the final depth.
+genPoint: function [env ctx buf expr][
+    if (type expr) = :word [
+        emitLine buf "    float3 q0 = p;"
+        emitLine buf ("    float3x3 J0 = " ++ identityMatrix ++ ";")
+        return 0
+    ]
+    if (type expr) = :block [
+        op: to :string expr\0
+        d: genPoint env ctx buf expr\1
+        n: d + 1
+        ns: to :string n
+        ds: to :string d
+        if op = "twist" [
+            rate: "(" ++ (scalar env ctx expr\2) ++ ")"
+            emitLine buf ("    float a" ++ ns ++ " = " ++ rate ++ " * q" ++ ds ++ ".y;")
+            emitLine buf ("    float c" ++ ns ++ " = cos(a" ++ ns ++ ");")
+            emitLine buf ("    float s" ++ ns ++ " = sin(a" ++ ns ++ ");")
+            emitLine buf ("    float dc" ++ ns ++ " = -s" ++ ns ++ " * " ++ rate ++ ";")
+            emitLine buf ("    float ds" ++ ns ++ " = c" ++ ns ++ " * " ++ rate ++ ";")
+            emitLine buf ("    float3 q" ++ ns ++ " = float3(c" ++ ns ++ " * q" ++ ds ++ ".x - s" ++ ns ++ " * q" ++ ds ++ ".z, q" ++ ds ++ ".y, s" ++ ns ++ " * q" ++ ds ++ ".x + c" ++ ns ++ " * q" ++ ds ++ ".z);")
+            emitLine buf ("    float3x3 J" ++ ns ++ " = float3x3(float3(c" ++ ns ++ ", 0.0, s" ++ ns ++ "), float3(dc" ++ ns ++ " * q" ++ ds ++ ".x - ds" ++ ns ++ " * q" ++ ds ++ ".z, 1.0, ds" ++ ns ++ " * q" ++ ds ++ ".x + dc" ++ ns ++ " * q" ++ ds ++ ".z), float3(-s" ++ ns ++ ", 0.0, c" ++ ns ++ ")) * J" ++ ds ++ ";")
+            return n
+        ]
+        if op = "repeat" [
+            cell: vec3Expr env ctx expr\2 expr\3 expr\4
+            emitLine buf ("    float3 c" ++ ns ++ " = " ++ cell ++ ";")
+            emitLine buf ("    float3 q" ++ ns ++ " = q" ++ ds ++ " - c" ++ ns ++ " * round(q" ++ ds ++ " / c" ++ ns ++ ");")
+            emitLine buf ("    float3x3 J" ++ ns ++ " = J" ++ ds ++ ";")
+            return n
+        ]
+        if op = "translate" [
+            offset: vec3Expr env ctx expr\2 expr\3 expr\4
+            emitLine buf ("    float3 q" ++ ns ++ " = q" ++ ds ++ " - " ++ offset ++ ";")
+            emitLine buf ("    float3x3 J" ++ ns ++ " = J" ++ ds ++ ";")
+            return n
+        ]
+        emitLine buf ("    float3 q" ++ ns ++ " = q" ++ ds ++ ";")
+        emitLine buf ("    float3x3 J" ++ ns ++ " = J" ++ ds ++ ";")
+        return n
+    ]
+    emitLine buf "    float3 q0 = p;"
+    emitLine buf ("    float3x3 J0 = " ++ identityMatrix ++ ";")
+    0
+]
+
+genBlend: function [env ctx node kind][
+    a: genSDF env ctx node\1
+    b: genSDF env ctx node\2
+    kText: scalar env ctx node\3
+    ctx\id: ctx\id + 1
+    id: ctx\id
+    name: "map_" ++ (to :string id)
+    buf: #[lines: []]
+    emitLine buf ("float " ++ name ++ "(float3 p, thread float3 &g, constant UniformPayload &u) {")
+    emitLine buf ("    float3 ga; float da = " ++ a ++ "(p, ga, u);")
+    emitLine buf ("    float3 gb; float db = " ++ b ++ "(p, gb, u);")
+    emitLine buf ("    float k = max(" ++ kText ++ ", 0.0001);")
+    if kind = "smin" [
+        emitLine buf "    float h = clamp(0.5 + 0.5 * (db - da) / k, 0.0, 1.0);"
+        emitLine buf "    g = mix(gb, ga, h);"
+        emitLine buf "    return mix(db, da, h) - k * h * (1.0 - h);"
+    ]
+    if kind = "smax" [
+        emitLine buf "    float h = clamp(0.5 - 0.5 * (db - da) / k, 0.0, 1.0);"
+        emitLine buf "    g = mix(gb, ga, h);"
+        emitLine buf "    return mix(db, da, h) + k * h * (1.0 - h);"
+    ]
+    emitLine buf "}"
+    text: join.with: "\n" buf\lines
+    ctx\lines: ctx\lines ++ @[text]
+    name
+]
+
+genUnion: function [env ctx node][
+    a: genSDF env ctx node\1
+    b: genSDF env ctx node\2
+    ctx\id: ctx\id + 1
+    id: ctx\id
+    name: "map_" ++ (to :string id)
+    buf: #[lines: []]
+    emitLine buf ("float " ++ name ++ "(float3 p, thread float3 &g, constant UniformPayload &u) {")
+    emitLine buf ("    float3 ga; float da = " ++ a ++ "(p, ga, u);")
+    emitLine buf ("    float3 gb; float db = " ++ b ++ "(p, gb, u);")
+    emitLine buf "    if (da < db) { g = ga; return da; }"
+    emitLine buf "    g = gb; return db;"
+    emitLine buf "}"
+    text: join.with: "\n" buf\lines
+    ctx\lines: ctx\lines ++ @[text]
+    name
+]
+
+genPrimitive: function [env ctx node op][
+    ctx\id: ctx\id + 1
+    id: ctx\id
+    name: "map_" ++ (to :string id)
+    buf: #[lines: []]
+    emitLine buf ("float " ++ name ++ "(float3 p, thread float3 &g, constant UniformPayload &u) {")
+    d: genPoint env ctx buf node\1
+    ds: to :string d
+    emitLine buf ("    float3 qd = q" ++ ds ++ ";")
+    emitLine buf ("    float3x3 Jd = J" ++ ds ++ ";")
+    if op = "sphere" [
+        radius: scalar env ctx node\2
+        emitLine buf "    float len = length(qd);"
+        emitLine buf ("    float dd = len - " ++ radius ++ ";")
+        emitLine buf "    g = transpose(Jd) * (qd / max(len, 1e-6));"
+        emitLine buf "    return dd;"
+    ]
+    if op = "gyroid" [
+        freq: scalar env ctx node\2
+        emitLine buf ("    float3 sv = sin(" ++ freq ++ " * qd);")
+        emitLine buf ("    float3 cv = cos(" ++ freq ++ " * qd);")
+        emitLine buf ("    float dd = dot(sv, cv.zxy) / max(" ++ freq ++ ", 1.0);")
+        emitLine buf "    float3 gq = cv * cv.zxy - sv * sv.zxy;"
+        emitLine buf "    float bound = length(qd) - 1.6;"
+        emitLine buf "    if (bound > dd) { dd = bound; gq = qd / max(length(qd), 1e-6); }"
+        emitLine buf "    g = transpose(Jd) * gq;"
+        emitLine buf "    return dd;"
+    ]
+    if op = "box" [
+        half: vec3Expr env ctx node\2 node\3 node\4
+        emitLine buf ("    float3 hb = " ++ half ++ ";")
+        emitLine buf "    float3 qq = abs(qd) - hb;"
+        emitLine buf "    float dd = length(max(qq, 0.0)) + min(max(qq.x, max(qq.y, qq.z)), 0.0);"
+        emitLine buf "    float3 gq = sign(qd) * normalize(max(qq, 0.0) + 1e-6);"
+        emitLine buf "    g = transpose(Jd) * gq;"
+        emitLine buf "    return dd;"
+    ]
+    if op = "torus" [
+        bigR: scalar env ctx node\2
+        smallR: scalar env ctx node\3
+        emitLine buf "    float L = length(qd.xz);"
+        emitLine buf ("    float2 tt = float2(L - " ++ bigR ++ ", qd.y);")
+        emitLine buf "    float lenT = max(length(tt), 1e-6);"
+        emitLine buf ("    float dd = lenT - " ++ smallR ++ ";")
+        emitLine buf ("    float scale = (L - " ++ bigR ++ ") / max(L, 1e-6) / lenT;")
+        emitLine buf "    float3 gq = float3(scale * qd.x, qd.y / lenT, scale * qd.z);"
+        emitLine buf "    g = transpose(Jd) * gq;"
+        emitLine buf "    return dd;"
+    ]
+    emitLine buf "}"
+    text: join.with: "\n" buf\lines
+    ctx\lines: ctx\lines ++ @[text]
+    name
+]
+
+genSDF: function [env ctx node][
+    op: to :string node\0
+    if op = "smin" [ return genBlend env ctx node "smin" ]
+    if op = "smax" [ return genBlend env ctx node "smax" ]
+    if op = "union" [ return genUnion env ctx node ]
+    genPrimitive env ctx node op
+]
+
+; ---------------------------------------------------------------- shader
+
+shaderPrologue: {
+#include <metal_stdlib>
+using namespace metal;
+
+struct UniformPayload {
+    float time;
+    float deltaTime;
+    float width;
+    float height;
+    float mouseX;
+    float mouseY;
+    float mouseDown;
+    float frameIndex;
+    float params[56];
+};
+
+struct VSOut {
+    float4 position [[position]];
+    float2 uv;
+};
+
+vertex VSOut vs_main(uint vid [[vertex_id]]) {
+    float2 pos[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
+    VSOut out;
+    out.position = float4(pos[vid], 0.0, 1.0);
+    out.uv = pos[vid] * 0.5 + 0.5;
+    return out;
+}
+}
+
+shaderEpilogue: function [rootName tintExpr gridExpr][
+    "float mapScene(float3 p, thread float3 &g, constant UniformPayload &u) { return " ++ rootName ++ "(p, g, u); }\n\n" ++
+    "fragment float4 fs_main(VSOut in [[stage_in]], constant UniformPayload &u [[buffer(0)]]) {\n" ++
+    "    float2 p = (in.uv * 2.0 - 1.0);\n" ++
+    "    p.x *= u.width / u.height;\n" ++
+    "    float2 m = float2(u.mouseX, u.mouseY);\n" ++
+    "    float yaw = (m.x - 0.5) * 6.28318;\n" ++
+    "    float pitch = clamp((m.y - 0.5) * 1.2, -1.2, 1.2);\n" ++
+    "    if (u.mouseDown < 0.5) { yaw = u.time * 0.25 + 0.7; pitch = 0.18; }\n" ++
+    "    float3 ro = float3(sin(yaw) * cos(pitch), sin(pitch) + 0.35, cos(yaw) * cos(pitch)) * 4.4;\n" ++
+    "    float3 fwd = normalize(float3(0.0) - ro);\n" ++
+    "    float3 right = normalize(cross(fwd, float3(0.0, 1.0, 0.0)));\n" ++
+    "    float3 up = cross(right, fwd);\n" ++
+    "    float3 rd = normalize(fwd * 2.2 + right * p.x + up * p.y);\n" ++
+    "    float t = 0.02;\n" ++
+    "    float d = 0.0;\n" ++
+    "    float3 g = float3(0.0, 1.0, 0.0);\n" ++
+    "    bool hit = false;\n" ++
+    "    for (int i = 0; i < 260; i++) {\n" ++
+    "        float3 pos = ro + rd * t;\n" ++
+    "        d = mapScene(pos, g, u);\n" ++
+    "        if (d < 0.0004) { hit = true; break; }\n" ++
+    "        t += d * 0.55;\n" ++
+    "        if (t > 24.0) { break; }\n" ++
+    "    }\n" ++
+    "    float3 col = mix(float3(0.015, 0.02, 0.04), float3(0.07, 0.09, 0.14), in.uv.y);\n" ++
+    "    float3 tint = " ++ tintExpr ++ ";\n" ++
+    "    if (hit) {\n" ++
+    "        float3 pos = ro + rd * t;\n" ++
+    "        float3 n;\n" ++
+    "        if (length(g) > 0.5) { n = normalize(g); } else {\n" ++
+    "            float e = 0.0012;\n" ++
+    "            float3 ga, gb, gc, gd, ge, gf;\n" ++
+    "            float dx1 = mapScene(pos + float3(e, 0.0, 0.0), ga, u);\n" ++
+    "            float dx2 = mapScene(pos - float3(e, 0.0, 0.0), gb, u);\n" ++
+    "            float dy1 = mapScene(pos + float3(0.0, e, 0.0), gc, u);\n" ++
+    "            float dy2 = mapScene(pos - float3(0.0, e, 0.0), gd, u);\n" ++
+    "            float dz1 = mapScene(pos + float3(0.0, 0.0, e), ge, u);\n" ++
+    "            float dz2 = mapScene(pos - float3(0.0, 0.0, e), gf, u);\n" ++
+    "            n = normalize(float3(dx1 - dx2, dy1 - dy2, dz1 - dz2));\n" ++
+    "        }\n" ++
+    "        float3 l1 = normalize(float3(0.5, 0.8, 0.35));\n" ++
+    "        float3 l2 = normalize(float3(-0.6, 0.25, -0.55));\n" ++
+    "        float diff1 = max(dot(n, l1), 0.0);\n" ++
+    "        float diff2 = max(dot(n, l2), 0.0);\n" ++
+    "        float rim = pow(1.0 - max(dot(n, -rd), 0.0), 2.5);\n" ++
+    "        float3 base = tint * (0.1 + 0.65 * diff1) + tint * float3(0.35, 0.5, 0.8) * (0.22 * diff2);\n" ++
+    "        float spec = pow(max(dot(reflect(-l1, n), -rd), 0.0), 32.0) * 0.25;\n" ++
+    "        col = base + tint * rim * 0.35 + spec;\n" ++
+    "    }\n" ++
+    "    float gridOn = " ++ gridExpr ++ ";\n" ++
+    "    if (gridOn > 0.5 && abs(rd.y) > 0.0001) {\n" ++
+    "        float tp = (-0.9 - ro.y) / rd.y;\n" ++
+    "        if (tp > 0.0 && (!hit || tp < t)) {\n" ++
+    "            float3 pp = ro + rd * tp;\n" ++
+    "            float2 gc = abs(fract(pp.xz) - 0.5);\n" ++
+    "            float line = smoothstep(0.46, 0.5, max(gc.x, gc.y));\n" ++
+    "            float fade = exp(-tp * 0.1);\n" ++
+    "            col = mix(col, float3(0.16, 0.22, 0.3), (1.0 - line) * 0.3 * fade);\n" ++
+    "        }\n" ++
+    "    }\n" ++
+    "    col = (col * (2.51 * col + 0.03)) / (col * (2.43 * col + 0.59) + 0.14);\n" ++
+    "    return float4(col, 1.0);\n" ++
+    "}\n"
+]
+
+tintExpression: function [env][
+    if key? env\slots "baseTint" [
+        s: env\slots\["baseTint"]
+        return "float3(u.params[" ++ (to :string s) ++ "], u.params[" ++ (to :string (s + 1)) ++ "], u.params[" ++ (to :string (s + 2)) ++ "])"
+    ]
+    "float3(0.2, 0.6, 1.0)"
+]
+
+gridExpression: function [env][
+    if key? env\slots "showGrid" [
+        return "u.params[" ++ (to :string env\slots\["showGrid"]) ++ "]"
+    ]
+    "0.0"
+]
+
+buildShader: function [env][
+    ctx: #[lines: [] id: 0]
+    ast: env\sdf
+    if null? ast [ ast: [sphere p 0.85] ]
+    rootName: genSDF env ctx ast
+    body: join.with: "\n" ctx\lines
+    src: shaderPrologue ++ "\n" ++ body ++ "\n" ++ (shaderEpilogue rootName (tintExpression env) (gridExpression env))
+    write src "/tmp/studio_generated.msl"
+    src
+]
+
+applyStudio: function [env title body w h][
+    if not? env\initialized [
+        sizeSpec: (to :string w) ++ "|" ++ (to :string h)
+        ffiCall 'studio_init_p @[title sizeSpec]
+        env\initialized: true
+    ]
+    ffiCall 'studio_begin_Spec @[]
+    env\sdf: null
+    scanBody env body
+    src: buildShader env
+    ok: ffiCall 'studio_compile_msl @[src]
+    if ok = 0 [ ffiCall 'studio_clear_error @[] ]
+]
+
+watchLoop: function [env path][
+    last: ""
+    if not? null? path [ last: read path ]
+    tick: 0
+    running: true
+    while [running][
+        alive: ffiCall 'studio_step @[]
+        if alive = 0 [ running: false ]
+        tick: tick + 1
+        if tick > 20 [
+            tick: 0
+            if not? null? path [
+                now: read path
+                if not? (now = last) [
+                    last: now
+                    err: try [ do now ]
+                    if not? null? err [
+                        ffiCall 'studio_report_error @[to :string err]
+                    ]
+                ]
+            ]
+        ]
+        ffiCall 'usleep @[8333]
+    ]
+]
+
+studio: function [title body][
+    env: studioEnv
+    w: attr 'width
+    h: attr 'height
+    watch: attr 'watch
+    if null? w [ w: 1200 ]
+    if null? h [ h: 780 ]
+    applyStudio env title body w h
+    if not? env\looping [
+        env\looping: true
+        watchLoop env watch
+    ]
+]

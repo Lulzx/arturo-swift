@@ -1,0 +1,15 @@
+import "studio.art"!
+
+studio .width:1200 .height:780 .watch:"scene.art" "SwiftUI + Metal Symbolic SDF Studio" [
+    slider 'radius     0.3..1.5   0.85
+    slider 'gyroidFreq 2.0..14.0  6.0
+    slider 'twistRate  0.0..4.0   1.4
+    slider 'smoothK    0.02..0.8  0.22
+    toggle 'showGrid   true
+    color  'baseTint   #3399ff
+    sdf .analytical [
+        smin [sphere [twist p twistRate] radius]
+             [gyroid [twist p twistRate] gyroidFreq]
+             smoothK
+    ]
+]

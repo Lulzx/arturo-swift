@@ -1,0 +1,60 @@
+; bundle.art — package a sketch and the native studio into a double-clickable app
+; Usage: arturo --no-color bundle.art
+
+appName: "SDF Studio"
+bundleId: "dev.arturo.sdfstudio"
+sketch: "scene.art"
+runtime: "studio.art"
+dylib: "libswift_studio.dylib"
+
+appPath: "dist/" ++ appName ++ ".app"
+contents: appPath ++ "/Contents"
+macosDir: contents ++ "/MacOS"
+resourcesDir: contents ++ "/Resources"
+frameworksDir: contents ++ "/Frameworks"
+
+arturoPath: first (split.lines (execute "command -v arturo"))
+if null? arturoPath [
+    print "error: arturo is not on PATH"
+    exit 1
+]
+
+mkdirs: "mkdir -p \"" ++ macosDir ++ "\" \"" ++ resourcesDir ++ "\" \"" ++ frameworksDir ++ "\" \"dist\""
+execute mkdirs
+
+plist: {
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>                     <string>SDF Studio</string>
+    <key>CFBundleDisplayName</key>              <string>SDF Studio</string>
+    <key>CFBundleIdentifier</key>               <string>dev.arturo.sdfstudio</string>
+    <key>CFBundleExecutable</key>               <string>SDF Studio</string>
+    <key>CFBundlePackageType</key>              <string>APPL</string>
+    <key>CFBundleShortVersionString</key>       <string>1.0</string>
+    <key>CFBundleVersion</key>                  <string>1</string>
+    <key>LSMinimumSystemVersion</key>           <string>14.0</string>
+    <key>NSHighResolutionCapable</key>          <true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key> <true/>
+    <key>NSPrincipalClass</key>                 <string>NSApplication</string>
+</dict>
+</plist>
+}
+
+launcher: "#!/bin/zsh\n" ++
+    "set -e\n" ++
+    "cd \"$(dirname \"$0\")/../Resources\"\n" ++
+    "exec \"" ++ arturoPath ++ "\" --no-color scene.art\n"
+
+write plist (contents ++ "/Info.plist")
+write launcher (macosDir ++ "/" ++ appName)
+execute ("chmod +x \"" ++ macosDir ++ "/" ++ appName ++ "\"")
+
+copy sketch (resourcesDir ++ "/" ++ sketch)
+copy runtime (resourcesDir ++ "/" ++ runtime)
+copy dylib (resourcesDir ++ "/" ++ dylib)
+copy dylib (frameworksDir ++ "/" ++ dylib)
+
+print ["bundled " appPath]
+print ["launch with: open \"" ++ appPath ++ "\""]
